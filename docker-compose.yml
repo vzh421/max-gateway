@@ -1,0 +1,40 @@
+name: max-gateway
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD не задан в .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gateway:${POSTGRES_PASSWORD}@db:5432/gateway
+      SESSION_DIR: /data/session
+      KILL_SWITCH_FILE: /data/KILL_SWITCH
+      API_HOST: 0.0.0.0
+      API_PORT: "8080"
+    volumes:
+      - gateway-data:/data
+    # Служебный API — только на localhost сервера, наружу не публикуется.
+    ports:
+      - "127.0.0.1:${GATEWAY_API_PORT:-8090}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  gateway-data:

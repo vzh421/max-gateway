@@ -1,0 +1,15 @@
+# Секреты и сессия MAX — никогда в образ
+.env
+.session/
+**/session.db*
+*.db
+*.db-*
+stage0_events*.jsonl
+# Прочее
+.git
+.venv
+venv
+**/__pycache__
+tests
+docs
+tools
