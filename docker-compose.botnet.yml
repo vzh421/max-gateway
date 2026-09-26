@@ -1,0 +1,13 @@
+# Необязательное дополнение: общая сеть с ботом (docs/bot-integration.md, раздел 4).
+#   docker network create max-net
+#   docker compose -f docker-compose.yml -f docker-compose.botnet.yml up -d
+services:
+  gateway:
+    networks:
+      default: {}
+      max-net:
+        aliases: [max-gateway]
+
+networks:
+  max-net:
+    external: true

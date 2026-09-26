@@ -11,7 +11,7 @@ from gateway.monitor import Monitor
 from gateway.safety import KillSwitch, SendGuard
 
 from .conftest import make_settings
-from .test_monitor_journal import RecNotifier
+from .helpers import RecNotifier
 
 
 @pytest.fixture

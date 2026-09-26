@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from gateway.config import PLACEHOLDER_MARK, Settings
 from gateway.db.models import MessageLog
 from gateway.safety import STATE_SENDS_BLOCKED, SendStatus
 
-from .helpers import seed_incoming
+from .helpers import age_out_outgoing, seed_incoming
 
 TEXT = "Ссылка на бота: https://max.ru/bot?start=abc"
 
@@ -27,7 +26,9 @@ def test_defaults_are_safe() -> None:
     assert s.reply_to_unknown is False
     assert s.mark_read is False
     assert s.kill_switch is False
-    assert s.reply_cooldown_days == 30
+    assert s.redirect_min_interval_hours == 24
+    assert s.redirect_max_reminders == 3
+    assert s.redirect_window_days == 30
     assert s.max_replies_per_hour == 10
     assert s.delay_range == (20.0, 90.0)
     assert s.token_ttl_days == 14
@@ -159,24 +160,68 @@ async def test_placeholder_allowed_in_dry_run(db, guard_factory) -> None:
     assert res.status is SendStatus.DRY_RUN
 
 
-# --- cooldown ---
+# --- перенаправления: не чаще раза в сутки, не больше 1 + 3 за окно ---
 
-async def test_cooldown_per_chat(db, transport, guard_factory) -> None:
+async def _age_out(db, hours: float) -> None:
+    await age_out_outgoing(db, hours)
+
+
+async def test_min_interval_per_chat(db, transport, guard_factory) -> None:
     await seed_incoming(db, 100)
     guard = guard_factory(dry_run=False)
     assert (await guard.send(100, TEXT)).status is SendStatus.SENT
     assert (await guard.send(100, TEXT)).status is SendStatus.BLOCKED_COOLDOWN
-    assert len(transport.sent) == 1
+    await _age_out(db, 23)
+    assert (await guard.send(100, TEXT)).status is SendStatus.BLOCKED_COOLDOWN
+    await _age_out(db, 1.5)
+    assert (await guard.send(100, TEXT)).status is SendStatus.SENT
+    assert len(transport.sent) == 2
 
 
-async def test_cooldown_expires(db, transport, guard_factory) -> None:
+async def test_chat_limit_first_plus_three(db, transport, guard_factory) -> None:
     await seed_incoming(db, 100)
     guard = guard_factory(dry_run=False)
-    first = await guard.send(100, TEXT)
-    async with db.session() as s, s.begin():
-        row = await s.get(MessageLog, first.log_id)
-        row.created_at = row.created_at - timedelta(days=31)
+    statuses = []
+    for _ in range(5):
+        statuses.append((await guard.send(100, TEXT)).status)
+        await _age_out(db, 25)
+    assert statuses == [SendStatus.SENT] * 4 + [SendStatus.BLOCKED_CHAT_LIMIT]
+    assert len(transport.sent) == 4
+
+
+async def test_chat_limit_window_restarts(db, transport, guard_factory) -> None:
+    await seed_incoming(db, 100)
+    guard = guard_factory(dry_run=False, redirect_max_reminders=0)
     assert (await guard.send(100, TEXT)).status is SendStatus.SENT
+    await _age_out(db, 25)
+    assert (await guard.send(100, TEXT)).status is SendStatus.BLOCKED_CHAT_LIMIT
+    await _age_out(db, 24 * 30)
+    assert (await guard.send(100, TEXT)).status is SendStatus.SENT
+
+
+async def test_cancel_during_delay_frees_slot(db, transport, guard_factory, sleeper) -> None:
+    await seed_incoming(db, 100)
+    guard = guard_factory(dry_run=False)
+
+    async def cancel() -> None:
+        raise asyncio.CancelledError
+
+    sleeper.hook = cancel
+    with pytest.raises(asyncio.CancelledError):
+        await guard.send(100, TEXT)
+    sleeper.hook = None
+    assert transport.sent == []
+    assert (await guard.send(100, TEXT)).status is SendStatus.SENT
+
+
+async def test_stale_pending_counts_as_sent(db, transport, guard_factory) -> None:
+    await seed_incoming(db, 100)
+    async with db.session() as s, s.begin():
+        s.add(MessageLog(channel="personal", direction="out", chat_id=100, status="pending", dry_run=False))
+    guard = guard_factory(dry_run=False)
+    assert await guard.cleanup_stale_pending() == 1
+    assert (await guard.send(100, TEXT)).status is SendStatus.BLOCKED_COOLDOWN
+    assert transport.sent == []
 
 
 async def test_dry_run_history_does_not_block_live(db, transport, guard_factory) -> None:
@@ -210,11 +255,7 @@ async def test_rate_limit_window_slides(db, transport, guard_factory) -> None:
     await seed_incoming(db, 1)
     await seed_incoming(db, 2)
     await guard.send(1, TEXT)
-    async with db.session() as s, s.begin():
-        await s.execute(
-            update(MessageLog).where(MessageLog.direction == "out")
-            .values(created_at=MessageLog.created_at - timedelta(minutes=61))
-        )
+    await _age_out(db, 61 / 60)
     assert (await guard.send(2, TEXT)).status is SendStatus.SENT
 
 
@@ -247,3 +288,17 @@ async def test_every_attempt_is_logged(db, guard_factory) -> None:
     async with db.session() as s:
         rows = (await s.execute(select(MessageLog.status).where(MessageLog.direction == "out"))).scalars().all()
     assert sorted(rows) == ["blocked:cooldown", "dry_run"]
+
+
+def test_env_example_loads(tmp_path: Path) -> None:
+    """.env.example как есть (пустые BOT_USERNAME/ADMIN_TOKEN и т.п.) — валидный безопасный конфиг."""
+    env = Path(__file__).resolve().parent.parent / ".env.example"
+    s = Settings(_env_file=str(env))
+    assert s.dry_run is True and s.bot_username is None
+    assert PLACEHOLDER_MARK in s.redirect_first_template and "{link}" in s.redirect_reminder_template
+
+
+def test_bad_bot_username_rejected() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, bot_username="bad name/")
+    assert Settings(_env_file=None, bot_username="@id123_bot").bot_username == "id123_bot"

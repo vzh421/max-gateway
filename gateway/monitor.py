@@ -9,9 +9,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Protocol
 
 from .db import Database, utcnow
+from .notify import Notifier
 from .pii import mask_text
 from .safety import STATE_SENDS_BLOCKED
 from .transport.base import StatusEvent, TransportStatus
@@ -19,17 +19,6 @@ from .transport.base import StatusEvent, TransportStatus
 log = logging.getLogger(__name__)
 
 _BLOCKING = {TransportStatus.DISCONNECTED, TransportStatus.SESSION_LOST, TransportStatus.ERROR}
-
-
-class Notifier(Protocol):
-    async def notify(self, text: str) -> None: ...
-
-
-class LogNotifier:
-    """Уведомления в лог. На этапе 2 заменяется отправкой через официального бота."""
-
-    async def notify(self, text: str) -> None:
-        log.warning("УВЕДОМЛЕНИЕ УПРАВЛЯЮЩЕМУ: %s", text)
 
 
 class Monitor:
@@ -51,7 +40,9 @@ class Monitor:
             if not already:
                 await self.notifier.notify(
                     f"Шлюз MAX: {event.status.value}. Отправки с личного аккаунта остановлены. "
-                    f"Причина: {detail}. Приём продолжается. Снять блокировку: python -m gateway sends resume"
+                    f"Причина: {detail}. Приём продолжается. Снять блокировку: python -m gateway sends resume",
+                    kind="monitor",
+                    urgent=True,
                 )
         elif event.status is TransportStatus.CONNECTED:
             log.info("MAX: соединение установлено")

@@ -1,4 +1,4 @@
-# Задание для сессии, работающей с VPS: развернуть каркас max-gateway (этап 1)
+# Задание для сессии, работающей с VPS: развернуть max-gateway (этапы 1–2)
 
 Это задание подготовила сессия разработки max-gateway. Прочитай его целиком, прежде чем
 что-либо делать. Отвечай пользователю на русском.
@@ -6,10 +6,12 @@
 ## Контекст
 
 max-gateway — шлюз между личным MAX арбитражного управляющего Жалсанова В.В. и
-официальным ботом. Сейчас — каркас: сервис подключается к личному MAX и **только пишет
-входящие в журнал (БД)**. Ответов нет. Режим `DRY_RUN=true`.
+официальным ботом. Сервис подключается к личному MAX, узнаёт должников по телефону и
+перенаправляет их в бот. Режим `DRY_RUN=true`: **ничего не отправляется**, решения только
+пишутся в журнал. Тексты — плейсхолдеры `[НЕ УТВЕРЖДЕНО]`: даже в боевом режиме такой
+текст не уйдёт.
 
-Подробности: `docs/stage1.md` в репозитории.
+Подробности: `docs/stage1.md`, `docs/stage2.md`, контракт с ботом — `docs/bot-integration.md`.
 
 ## Жёсткие ограничения
 
@@ -57,8 +59,16 @@ chmod 600 .env
 - `GATEWAY_API_PORT` — проверить, что порт свободен (`ss -ltn | grep 8090`); если занят —
   взять другой свободный.
 
-Остальное **не менять**: `DRY_RUN=true`, `KILL_SWITCH=false`, `AUTO_REPLY_TEMPLATE`
-с меткой `[НЕ УТВЕРЖДЕНО]`.
+Связь с ботом (бот ведёт другая сессия; значения согласовать с пользователем):
+- `BOT_USERNAME` — ник бота;
+- `BOT_API_KEY` — сгенерировать `openssl rand -hex 24` и передать сессии бота;
+- `BOT_NOTIFY_URL`, `BOT_NOTIFY_KEY` — эндпоинт уведомлений бота и ключ (от сессии бота).
+  Пока их нет — оставить пустыми, уведомления пойдут в лог.
+- Если бот в Docker на этом же сервере — общая сеть: `docker network create max-net` и
+  запуск с `-f docker-compose.yml -f docker-compose.botnet.yml` (см. `docs/bot-integration.md`, раздел 4).
+
+Остальное **не менять**: `DRY_RUN=true`, `KILL_SWITCH=false`, шаблоны
+`REDIRECT_*_TEMPLATE` с меткой `[НЕ УТВЕРЖДЕНО]`.
 
 ### 3. Сборка и БД
 
@@ -115,12 +125,17 @@ docker compose exec gateway python -m gateway sends resume
 Попроси пользователя написать себе в личный MAX с другого номера. Затем:
 
 ```bash
-docker compose logs --since 5m gateway | grep -E "Входящее|ERROR|УВЕДОМЛЕНИЕ" | tail -20
+docker compose logs --since 5m gateway | grep -E "Чат |ERROR|УВЕДОМЛЕНИЕ" | tail -20
 docker compose exec db psql -U gateway -d gateway -c \
   "select direction, count(*) from message_log group by direction;"
 ```
 
-Ожидается: строки «Входящее: …», записи `in` в `message_log`, записей `out` нет.
+Ожидается: строка «Чат …: <решение>» на каждое входящее, записи `in` в `message_log`.
+Записи `out` возможны только со статусом `dry_run` (решение «отправил бы»), `sent` быть не должно:
+```bash
+docker compose exec db psql -U gateway -d gateway -c \
+  "select status, dry_run, count(*) from message_log where direction='out' group by 1,2;"
+```
 В логах не должно быть полных номеров телефонов:
 ```bash
 docker compose logs gateway | grep -E '(\+?7|8)[0-9]{10}' | head

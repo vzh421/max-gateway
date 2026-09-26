@@ -81,6 +81,8 @@ class PersonalChat(Base):
     first_seen_at: Mapped[datetime] = _now()
     last_incoming_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_auto_reply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Когда управляющему сообщили, что лимит перенаправлений исчерпан (чтобы не повторять).
+    limit_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class LinkToken(Base):
@@ -89,8 +91,10 @@ class LinkToken(Base):
     __tablename__ = "link_tokens"
 
     token: Mapped[str] = mapped_column(String(128), primary_key=True)
-    case_id: Mapped[str | None] = mapped_column(String(64))  # None — выбор дела в боте
-    personal_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    case_id: Mapped[str | None] = mapped_column(String(64))  # None — дело выбирается в боте
+    # Если номер найден в нескольких делах — все кандидаты (выбор в боте).
+    candidate_case_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    personal_chat_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     created_at: Mapped[datetime] = _now()
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -135,7 +139,7 @@ class MessageLog(Base):
     text: Mapped[str | None] = mapped_column(Text)
     attachments: Mapped[list[Any] | None] = mapped_column(JSON)
     case_id: Mapped[str | None] = mapped_column(String(64))
-    # Для исходящих: auto_reply / notification / bot_reply.
+    # Для исходящих: redirect_first / redirect_reminder.
     kind: Mapped[str | None] = mapped_column(String(32))
     # Для исходящих: pending / sent / dry_run / blocked:<причина> / failed.
     status: Mapped[str | None] = mapped_column(String(48))

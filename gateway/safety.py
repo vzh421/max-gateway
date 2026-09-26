@@ -6,7 +6,8 @@ SendGuard — единственная точка, через которую у�
   2. блокировка мониторингом (разрыв/слёт сессии/ошибка) — правило 9;
   3. неутверждённый текст (плейсхолдер) — только в боевом режиме;
   4. чат писал нам первым — «никаких рассылок первым» (правило 5);
-  5. cooldown на чат — правило 5;
+  5. перенаправлений в чат за окно REDIRECT_WINDOW_DAYS не больше 1 + REDIRECT_MAX_REMINDERS,
+     и не чаще раза в REDIRECT_MIN_INTERVAL_HOURS — правило 5;
   6. лимит в час — правило 6;
   7. dry-run — правило 1 (только запись «отправил бы»).
 Перед боевой отправкой — случайная задержка REPLY_DELAY_SEC и повторная проверка 1–2.
@@ -19,11 +20,11 @@ import logging
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from .config import PLACEHOLDER_MARK, Settings
 from .db import Database, utcnow
@@ -34,17 +35,49 @@ log = logging.getLogger(__name__)
 
 STATE_SENDS_BLOCKED = "sends_blocked"
 PERSONAL = "personal"
+# Статусы исходящих, которые считаются «отправленными» для лимитов (в своём режиме).
+COUNTED_STATUSES = ("sent", "dry_run", "pending", "unknown")
+
+
+@dataclass(frozen=True)
+class ChatHistory:
+    count: int  # отправлено в чат за окно (в том же режиме dry-run/боевой)
+    last_at: datetime | None
+
+
+async def chat_history(db: Database, chat_id: int, *, dry_run: bool, window_days: int) -> ChatHistory:
+    since = utcnow() - timedelta(days=window_days)
+    async with db.session() as s:
+        row = (
+            await s.execute(
+                select(func.count(), func.max(MessageLog.created_at)).where(
+                    MessageLog.channel == PERSONAL,
+                    MessageLog.direction == "out",
+                    MessageLog.chat_id == chat_id,
+                    MessageLog.dry_run.is_(dry_run),
+                    MessageLog.status.in_(COUNTED_STATUSES),
+                    MessageLog.created_at >= since,
+                )
+            )
+        ).one()
+    last = row[1]
+    if last is not None and last.tzinfo is None:  # SQLite возвращает время без зоны
+        last = last.replace(tzinfo=timezone.utc)
+    return ChatHistory(count=row[0], last_at=last)
 
 
 class SendStatus(StrEnum):
     SENT = "sent"
     DRY_RUN = "dry_run"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"  # сервис упал во время отправки — считаем отправленным (без дублей)
     BLOCKED_KILL_SWITCH = "blocked:kill_switch"
     BLOCKED_MONITOR = "blocked:monitor"
     BLOCKED_PLACEHOLDER = "blocked:placeholder"
     BLOCKED_NOT_INITIATED = "blocked:not_initiated"
     BLOCKED_COOLDOWN = "blocked:cooldown"
+    BLOCKED_CHAT_LIMIT = "blocked:chat_limit"
     BLOCKED_RATE_LIMIT = "blocked:rate_limit"
 
 
@@ -106,10 +139,24 @@ class SendGuard:
         # Проверка лимитов и резервирование записи — атомарно в пределах процесса.
         self._lock = asyncio.Lock()
 
+    async def cleanup_stale_pending(self) -> int:
+        """«pending» после аварийной остановки: неизвестно, ушло ли сообщение.
+
+        Помечаем «unknown» — оно продолжает учитываться в лимитах (лучше не ответить,
+        чем ответить дважды), но больше не висит как незавершённое.
+        """
+        async with self.db.session() as s, s.begin():
+            result = await s.execute(
+                update(MessageLog)
+                .where(MessageLog.direction == "out", MessageLog.status == "pending")
+                .values(status=SendStatus.UNKNOWN.value)
+            )
+            return result.rowcount or 0
+
     async def sends_blocked(self) -> dict | None:
         return await self.db.get_state(STATE_SENDS_BLOCKED)
 
-    async def send(self, chat_id: int, text: str, *, kind: str = "auto_reply", case_id: str | None = None) -> SendResult:
+    async def send(self, chat_id: int, text: str, *, kind: str = "redirect", case_id: str | None = None) -> SendResult:
         dry_run = self.settings.dry_run
         async with self._lock:
             status, detail = await self._precheck(chat_id, text, dry_run)
@@ -126,7 +173,12 @@ class SendGuard:
             return SendResult(status, log_id, detail)
 
         low, high = self.settings.delay_range
-        await self._sleep(self._rng.uniform(low, high))
+        try:
+            await self._sleep(self._rng.uniform(low, high))
+        except asyncio.CancelledError:
+            # Остановка сервиса во время задержки: не отправляем и снимаем резерв.
+            await asyncio.shield(self._finish(log_id, SendStatus.CANCELLED, "остановка во время задержки"))
+            raise
 
         # За время задержки могли включить kill switch или упасть соединение.
         if self.kill_switch.active:
@@ -161,27 +213,22 @@ class SendGuard:
             if not initiated:
                 return SendStatus.BLOCKED_NOT_INITIATED, "в этот чат нам ещё не писали"
 
-            sent_statuses = [SendStatus.SENT.value, SendStatus.DRY_RUN.value, "pending"]
-            since_cooldown = now - timedelta(days=self.settings.reply_cooldown_days)
-            recent_to_chat = await s.scalar(
-                select(func.count()).select_from(MessageLog).where(
-                    MessageLog.channel == PERSONAL,
-                    MessageLog.direction == "out",
-                    MessageLog.chat_id == chat_id,
-                    MessageLog.dry_run.is_(dry_run),
-                    MessageLog.status.in_(sent_statuses),
-                    MessageLog.created_at >= since_cooldown,
-                )
+            history = await chat_history(
+                self.db, chat_id, dry_run=dry_run, window_days=self.settings.redirect_window_days
             )
-            if recent_to_chat:
-                return SendStatus.BLOCKED_COOLDOWN, f"ответ в этот чат уже был за {self.settings.reply_cooldown_days} дн."
+            max_total = 1 + self.settings.redirect_max_reminders
+            if history.count >= max_total:
+                return SendStatus.BLOCKED_CHAT_LIMIT, f"в чат уже ушло {history.count} из {max_total} за окно"
+            min_interval = timedelta(hours=self.settings.redirect_min_interval_hours)
+            if history.last_at is not None and now - history.last_at < min_interval:
+                return SendStatus.BLOCKED_COOLDOWN, f"прошло меньше {self.settings.redirect_min_interval_hours} ч"
 
             last_hour = await s.scalar(
                 select(func.count()).select_from(MessageLog).where(
                     MessageLog.channel == PERSONAL,
                     MessageLog.direction == "out",
                     MessageLog.dry_run.is_(dry_run),
-                    MessageLog.status.in_(sent_statuses),
+                    MessageLog.status.in_(COUNTED_STATUSES),
                     MessageLog.created_at >= now - timedelta(hours=1),
                 )
             )

@@ -224,8 +224,14 @@ class PyMaxTransport(PersonalAccountTransport):
         client = self._require_client()
         return [Contact(user_id=u.id, phone=normalize_phone(u.phone)) for u in client.contacts if u is not None]
 
+    def format_link(self, url: str) -> str:
+        # PyMax разбирает исходящий текст как markdown и вырезает «_» даже внутри адреса
+        # (https://max.ru/test_bot → testbot); экранирование «\_» не работает. Форма
+        # [url](url) сохраняет адрес целиком (элемент LINK) — проверено на Formatter 2.4.1.
+        return f"[{url}]({url})"
+
     async def send_text(self, chat_id: int, text: str) -> int | None:
-        # PyMax разбирает текст как markdown (pymax/infra/message.py) — шаблоны это учитывают.
+        # PyMax разбирает текст как markdown (pymax/infra/message.py); ссылки — через format_link.
         msg = await self._require_client().send_message(chat_id, text)
         return msg.id if msg else None
 

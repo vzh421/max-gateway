@@ -92,6 +92,10 @@ class PersonalAccountTransport(abc.ABC):
     async def list_contacts(self) -> list[Contact]:
         """Контакты адресной книги аккаунта, известные транспорту на данный момент."""
 
+    def format_link(self, url: str) -> str:
+        """Как вставить ссылку в текст, чтобы транспорт её не испортил."""
+        return url
+
     @abc.abstractmethod
     async def send_text(self, chat_id: int, text: str) -> int | None:
         """Отправить текст. Только через SendGuard! Возвращает id сообщения, если известен."""

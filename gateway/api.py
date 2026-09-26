@@ -9,6 +9,7 @@ import hmac
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .config import Settings
@@ -16,6 +17,7 @@ from .db import Database
 from .importers import ImportReport, PhoneRow, add_debtor_phones, parse_debtor_phones
 from .monitor import Monitor
 from .safety import KillSwitch, SendGuard
+from .tokens import TokenState, get_token_info, redeem_token
 from .transport.base import PersonalAccountTransport
 
 
@@ -28,6 +30,11 @@ class PhoneIn(BaseModel):
 class PhonesIn(BaseModel):
     source: str = "api"
     items: list[PhoneIn]
+
+
+class RedeemIn(BaseModel):
+    bot_user_id: int
+    bot_chat_id: int | None = None
 
 
 class KillSwitchIn(BaseModel):
@@ -53,6 +60,38 @@ def create_app(
             raise HTTPException(401, "Неверный X-Admin-Token")
 
     admin = [Depends(require_admin)]
+
+    def require_bot(x_api_key: Annotated[str | None, Header()] = None) -> None:
+        expected = settings.bot_api_key.get_secret_value() if settings.bot_api_key else None
+        if not expected:
+            raise HTTPException(503, "BOT_API_KEY не задан — API для бота выключен")
+        if not x_api_key or not hmac.compare_digest(x_api_key, expected):
+            raise HTTPException(401, "Неверный X-Api-Key")
+
+    bot = [Depends(require_bot)]
+
+    # --- API для бота (контракт: docs/bot-integration.md) ---
+
+    @app.get("/bot-api/v1/tokens/{token}", dependencies=bot)
+    async def token_info(token: str) -> dict:
+        info = await get_token_info(db, token)
+        if info.state is TokenState.NOT_FOUND:
+            raise HTTPException(404, {"status": "not_found"})
+        return info.as_dict()
+
+    @app.post("/bot-api/v1/tokens/{token}/redeem", dependencies=bot)
+    async def token_redeem(token: str, body: RedeemIn) -> JSONResponse:
+        info, redeemed = await redeem_token(db, token, bot_user_id=body.bot_user_id)
+        data = info.as_dict() | {"redeemed_now": redeemed}
+        if info.state is TokenState.NOT_FOUND:
+            return JSONResponse(data, status_code=404)
+        if redeemed:
+            return JSONResponse(data, status_code=200)
+        if info.state is TokenState.USED and info.used_by_bot_user_id == body.bot_user_id:
+            return JSONResponse(data, status_code=200)  # повтор тем же пользователем — идемпотентно
+        if info.state is TokenState.EXPIRED:
+            return JSONResponse(data, status_code=410)
+        return JSONResponse(data, status_code=409)  # погашен другим пользователем
 
     @app.get("/health")
     async def health() -> dict:

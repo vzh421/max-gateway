@@ -104,3 +104,18 @@ def test_no_read_marks_anywhere() -> None:
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert not re.search(r"\.read\(\)|read_message\(|mark_read\(", text), path
+
+
+def test_link_survives_pymax_markdown() -> None:
+    """Ссылка с «_» в нике бота доходит до MAX целиком (элемент LINK)."""
+    from pymax.formatting.markdown import Formatter
+
+    from gateway.tokens import deep_link, new_token
+
+    url = deep_link("id123_test_bot", new_token())
+    t = PyMaxTransport("+70000000000", Path("/nonexistent"))
+    clean, elements = Formatter.format_markdown(f"Пишите в бот: {t.format_link(url)}")
+    assert url in clean
+    assert [e.attributes.url for e in elements if e.type == "LINK"] == [url]
+    # без обёртки PyMax портит адрес — поэтому обёртка обязательна
+    assert url not in Formatter.format_markdown(url)[0]

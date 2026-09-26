@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,7 +23,12 @@ class Settings(BaseSettings):
     # --- Защитные правила (CLAUDE.md, раздел «ВАЖНО») ---
     dry_run: bool = True
     reply_to_unknown: bool = False
-    reply_cooldown_days: int = Field(default=30, ge=1)
+    # Перенаправление в бот (правило 5): первая ссылка, затем не более
+    # REDIRECT_MAX_REMINDERS мягких напоминаний, не чаще раза в REDIRECT_MIN_INTERVAL_HOURS,
+    # в пределах окна REDIRECT_WINDOW_DAYS. Дальше — тишина и уведомление управляющему.
+    redirect_min_interval_hours: float = Field(default=24, gt=0)
+    redirect_max_reminders: int = Field(default=3, ge=0)
+    redirect_window_days: int = Field(default=30, ge=1)
     max_replies_per_hour: int = Field(default=10, ge=0)
     reply_delay_sec: str = "20-90"
     mark_read: bool = False
@@ -43,9 +49,15 @@ class Settings(BaseSettings):
     ai4au_base_url: str = "https://ai4au.ru"
     ai4au_api_token: SecretStr | None = None
 
-    # --- Официальный бот (этап 2) ---
-    bot_token: SecretStr | None = None
+    # --- Официальный бот (ведётся в отдельной сессии; здесь — только ссылка и API обмена) ---
     bot_username: str | None = None
+    # Ключ, с которым бот обращается к /bot-api/* шлюза (заголовок X-Api-Key).
+    bot_api_key: SecretStr | None = None
+    # Куда шлюз отправляет уведомления управляющему (эндпоинт бота) и ключ к нему.
+    bot_notify_url: str | None = None
+    bot_notify_key: SecretStr | None = None
+    # Несрочные уведомления копятся и уходят сводкой раз в N минут.
+    notify_digest_minutes: float = Field(default=60, gt=0)
 
     # --- Служебный API ---
     api_host: str = "127.0.0.1"  # в docker compose — 0.0.0.0, порт проброшен только на 127.0.0.1
@@ -53,7 +65,8 @@ class Settings(BaseSettings):
     admin_token: SecretStr | None = None
 
     # --- Тексты: утверждает управляющий ---
-    auto_reply_template: str = f"{PLACEHOLDER_MARK} Текст автоответа со ссылкой {{link}}"
+    redirect_first_template: str = f"{PLACEHOLDER_MARK} Первое перенаправление в бот: {{link}}"
+    redirect_reminder_template: str = f"{PLACEHOLDER_MARK} Мягкое напоминание про бот: {{link}}"
 
     log_level: str = "INFO"
 
@@ -77,6 +90,23 @@ class Settings(BaseSettings):
         if v.upper() == "DEBUG":
             raise ValueError("LOG_LEVEL=DEBUG запрещён: библиотека MAX пишет в лог токен сессии")
         return v.upper()
+
+    @field_validator("redirect_first_template", "redirect_reminder_template")
+    @classmethod
+    def _template_has_link(cls, v: str) -> str:
+        if "{link}" not in v:
+            raise ValueError("шаблон перенаправления должен содержать {link}")
+        v.format(link="x")  # другие {…} в шаблоне недопустимы
+        return v
+
+    @field_validator("bot_username")
+    @classmethod
+    def _bot_username(cls, v: str | None) -> str | None:
+        if not v:
+            return None  # пустое значение из .env
+        if not re.fullmatch(r"[A-Za-z0-9_]+", v.lstrip("@")):
+            raise ValueError("BOT_USERNAME: ожидается ник бота (латиница, цифры, _)")
+        return v.lstrip("@")
 
     @property
     def delay_range(self) -> tuple[float, float]:

@@ -1,7 +1,8 @@
 """Сборка и запуск сервиса: транспорт + core + мониторинг + служебный API в одном процессе.
 
-Бот (этап 2) будет жить в этом же процессе: общая БД и уведомления управляющему через
-бота нужны и шлюзу (мониторинг), и боту; webhook бота обслуживает тот же FastAPI.
+Официальный бот — отдельный сервис (другая сессия разработки). Связь с ним — по HTTP:
+бот гасит токены через /bot-api/*, шлюз шлёт уведомления на BOT_NOTIFY_URL
+(контракт — docs/bot-integration.md).
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from .api import create_app
 from .config import Settings
 from .core import Core
 from .db import Database
-from .monitor import LogNotifier, Monitor
+from .monitor import Monitor
+from .notify import BotApiNotifier, DigestNotifier, LogNotifier, Notifier
 from .safety import KillSwitch, SendGuard
 from .transport.base import PersonalAccountTransport, StatusEvent, TransportStatus
 from .transport.pymax_transport import LoginRequiredError, PyMaxTransport
@@ -33,18 +35,32 @@ async def run_service(settings: Settings, transport: PersonalAccountTransport | 
     db = Database(settings.database_url)
     transport = transport or build_transport(settings)
     kill_switch = KillSwitch(settings.kill_switch, settings.kill_switch_file)
-    monitor = Monitor(db, LogNotifier())
+    base_notifier: Notifier = (
+        BotApiNotifier(settings.bot_notify_url, settings.bot_notify_key.get_secret_value() if settings.bot_notify_key else None)
+        if settings.bot_notify_url
+        else LogNotifier()
+    )
+    notifier = DigestNotifier(base_notifier, settings.notify_digest_minutes * 60)
+    monitor = Monitor(db, notifier)
     guard = SendGuard(settings, db, transport, kill_switch)
-    core = Core(db)
+    core = Core(settings, db, transport, guard, notifier)
 
     log.warning(
-        "Старт: транспорт=%s, DRY_RUN=%s, KILL_SWITCH=%s, лимит=%s/ч, cooldown=%s дн.",
+        "Старт: транспорт=%s, DRY_RUN=%s, KILL_SWITCH=%s, лимит=%s/ч, перенаправлений на чат 1+%s "
+        "не чаще %s ч, бот=%s, уведомления=%s",
         transport.name,
         settings.dry_run,
         kill_switch.active,
         settings.max_replies_per_hour,
-        settings.reply_cooldown_days,
+        settings.redirect_max_reminders,
+        settings.redirect_min_interval_hours,
+        settings.bot_username or "НЕ ЗАДАН",
+        "бот" if settings.bot_notify_url else "лог",
     )
+
+    stale = await guard.cleanup_stale_pending()
+    if stale:
+        log.warning("Незавершённых отправок после аварийной остановки: %s — помечены unknown", stale)
 
     api = create_app(settings, db, transport, guard, monitor, kill_switch)
     server = uvicorn.Server(
@@ -52,6 +68,7 @@ async def run_service(settings: Settings, transport: PersonalAccountTransport | 
     )
     api_task = asyncio.create_task(server.serve(), name="api")
     transport_task = asyncio.create_task(_run_transport(transport, core, monitor), name="transport")
+    digest_task = asyncio.create_task(notifier.run(), name="digest")
     try:
         # Процесс живёт, пока жив служебный API (до SIGTERM). Падение транспорта процесс
         # НЕ завершает: иначе restart-политика Docker переподключала бы личный аккаунт к MAX
@@ -60,9 +77,13 @@ async def run_service(settings: Settings, transport: PersonalAccountTransport | 
         await api_task
     finally:
         await transport.stop()
+        await core.cancel_pending()  # незавершённые отправки не выполняем при остановке
         server.should_exit = True
         transport_task.cancel()
-        await asyncio.gather(api_task, transport_task, return_exceptions=True)
+        digest_task.cancel()  # при отмене сводка сбрасывается (DigestNotifier.run → flush)
+        await asyncio.gather(api_task, transport_task, digest_task, return_exceptions=True)
+        if isinstance(base_notifier, BotApiNotifier):
+            await base_notifier.aclose()
         await db.dispose()
 
 
