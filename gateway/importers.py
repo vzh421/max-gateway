@@ -101,15 +101,24 @@ async def import_debtor_phones_csv(db: Database, path: Path, source: str | None 
 async def add_whitelist(
     db: Database, *, phone: str | None = None, max_user_id: int | None = None, source: str = "manual", note: str | None = None
 ) -> bool:
-    """False — запись уже есть (по телефону или id MAX)."""
+    """False — запись уже есть (по телефону или id MAX).
+
+    Ручное добавление номера, который уже попал в список из адресной книги MAX, повышает
+    запись до «manual»: ручной белый список сильнее контактов телефона.
+    """
     if phone is None and max_user_id is None:
         raise ValueError("Нужен телефон или id MAX")
     async with db.session() as s, s.begin():
-        if phone and await s.scalar(select(WhitelistEntry.id).where(WhitelistEntry.phone == phone)):
-            return False
-        if max_user_id is not None and await s.scalar(
-            select(WhitelistEntry.id).where(WhitelistEntry.max_user_id == max_user_id)
-        ):
+        existing = None
+        if phone:
+            existing = await s.scalar(select(WhitelistEntry).where(WhitelistEntry.phone == phone))
+        if existing is None and max_user_id is not None:
+            existing = await s.scalar(select(WhitelistEntry).where(WhitelistEntry.max_user_id == max_user_id))
+        if existing is not None:
+            if source == "manual" and existing.source != "manual":
+                existing.source = "manual"
+                existing.note = note or existing.note
+                return True
             return False
         s.add(WhitelistEntry(phone=phone, max_user_id=max_user_id, source=source, note=note, created_at=utcnow()))
     return True

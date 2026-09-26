@@ -7,6 +7,12 @@
   import-phones FILE      импорт телефонов должников из CSV (case_id, phone[, note])
   whitelist add PHONE     добавить номер в белый список
   whitelist list          показать белый список (номера маскированы)
+  import-debtors FILE     список должников из CSV (case_id, debtor_name[, case_number])
+  google-auth             разрешить чтение Google Контактов (один раз, управляющий лично)
+  contacts sync           загрузить контакты телефона и разделить: должники / остальные / спорные
+  contacts review-export FILE   спорные — в CSV для проверки (открывается в Excel)
+  contacts review-import FILE   загрузить решения («должник» / «не должник»)
+  contacts stats          сколько контактов в каждой группе
   kill on|off|status      аварийный выключатель отправок
   sends status|resume     блокировка отправок мониторингом
 """
@@ -98,6 +104,82 @@ async def cmd_whitelist(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_import_debtors(args: argparse.Namespace) -> int:
+    from .contacts import import_debtors_csv
+
+    db = Database(get_settings().database_url)
+    try:
+        report = await import_debtors_csv(db, Path(args.file), args.source)
+    finally:
+        await db.dispose()
+    print("Должники:", report.summary().replace("уже были", "обновлено"))
+    return 0 if not report.errors else 1
+
+
+async def cmd_google_auth() -> int:
+    import httpx
+
+    from .google_contacts import exchange_code, make_auth_request, parse_redirect, save_refresh_token
+
+    settings = get_settings()
+    if not settings.google_client_id or not settings.google_client_secret:
+        print("Задайте GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET в .env (см. docs/contacts.md)")
+        return 2
+    url, verifier, state = make_auth_request(settings.google_client_id)
+    print("1. Откройте в браузере (войдите в Google-аккаунт с контактами телефона):\n")
+    print(url)
+    print("\n2. Разрешите доступ «только чтение контактов».")
+    print("3. Браузер перейдёт на http://127.0.0.1:8765/… и покажет ошибку — это нормально.")
+    print("   Скопируйте ПОЛНЫЙ адрес из адресной строки и вставьте сюда.\n")
+    redirect = input("Адрес: ")
+    code = parse_redirect(redirect, state)
+    async with httpx.AsyncClient(timeout=30) as client:
+        token = await exchange_code(
+            client, settings.google_client_id, settings.google_client_secret.get_secret_value(), code, verifier
+        )
+    save_refresh_token(settings.google_token_file, token)
+    print(f"Готово: доступ сохранён в {settings.google_token_file} (права 600). Дальше: python -m gateway contacts sync")
+    return 0
+
+
+async def cmd_contacts(args: argparse.Namespace) -> int:
+    from .contacts import contact_stats, export_review, import_review, sync_contacts
+
+    settings = get_settings()
+    db = Database(settings.database_url)
+    try:
+        if args.action == "sync":
+            from .google_contacts import load_google_contacts
+
+            if not settings.google_client_id or not settings.google_client_secret:
+                print("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET не заданы")
+                return 2
+            contacts = await load_google_contacts(
+                settings.google_client_id, settings.google_client_secret.get_secret_value(), settings.google_token_file
+            )
+            report = await sync_contacts(db, contacts)
+            print("Контакты:", report.summary())
+            if report.by_status["review"]:
+                print("Спорные: python -m gateway contacts review-export review.csv")
+        elif args.action == "review-export":
+            if not args.file:
+                print("Укажите файл")
+                return 2
+            n = await export_review(db, Path(args.file))
+            print(f"Спорных: {n}. Файл: {args.file}. Заполните колонку «решение»: должник / не должник")
+        elif args.action == "review-import":
+            if not args.file:
+                print("Укажите файл")
+                return 2
+            report = await import_review(db, Path(args.file))
+            print("Решения:", report.summary().replace("добавлено", "принято"))
+        else:
+            print(await contact_stats(db))
+    finally:
+        await db.dispose()
+    return 0
+
+
 def cmd_kill(args: argparse.Namespace) -> int:
     settings = get_settings()
     ks = KillSwitch(settings.kill_switch, settings.kill_switch_file)
@@ -142,6 +224,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("action", choices=["add", "list"])
     p.add_argument("phone", nargs="?")
     p.add_argument("--note", default=None)
+    p = sub.add_parser("import-debtors")
+    p.add_argument("file")
+    p.add_argument("--source", default=None)
+    sub.add_parser("google-auth", help="разрешить чтение Google Контактов")
+    p = sub.add_parser("contacts")
+    p.add_argument("action", choices=["sync", "review-export", "review-import", "stats"])
+    p.add_argument("file", nargs="?")
     p = sub.add_parser("kill")
     p.add_argument("action", choices=["on", "off", "status"])
     p.add_argument("--note", default=None)
@@ -171,6 +260,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "add" and not args.phone:
             parser.error("whitelist add: нужен номер")
         return asyncio.run(cmd_whitelist(args))
+    if args.cmd == "import-debtors":
+        return asyncio.run(cmd_import_debtors(args))
+    if args.cmd == "google-auth":
+        return asyncio.run(cmd_google_auth())
+    if args.cmd == "contacts":
+        return asyncio.run(cmd_contacts(args))
     if args.cmd == "kill":
         return cmd_kill(args)
     if args.cmd == "sends":

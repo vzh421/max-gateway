@@ -4,7 +4,9 @@
   1. журнал (всегда, до любой обработки; повтор события — выход);
   2. фильтры: не своё, не канал, личный чат (DIALOG), отправитель не бот (правило 4);
   3. учёт собеседника в personal_chats (телефон, дело, первое/последнее обращение);
-  4. белый список → стоп (если номер совпал с должником — уведомить управляющего; правило 3);
+  4. защита (правило 3): ручной белый список, контакты телефона — не должники или на проверке,
+     адресная книга MAX → без ответа (если номер совпал с должником — уведомить управляющего);
+     должник из контактов телефона — отвечаем;
   5. поиск в debtor_phones: не найден → уведомление, без ответа (REPLY_TO_UNKNOWN=false);
   6. перенаправление: первое сообщение со ссылкой, затем до REDIRECT_MAX_REMINDERS мягких
      напоминаний не чаще раза в REDIRECT_MIN_INTERVAL_HOURS; дальше — тишина и одно
@@ -26,7 +28,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import Database, utcnow
 from .db.models import DebtorPhone, PersonalChat
-from .importers import is_whitelisted
+from .contacts import protection_reason
 from .journal import record_incoming
 from .notify import Notifier
 from .pii import mask_phone
@@ -92,11 +94,12 @@ class Core:
         chat, is_new = await self._register_chat(msg, phone, case_ids)
 
         # 4. Белый список (правило 3).
-        if await is_whitelisted(self.db, phone=phone, max_user_id=msg.sender_id):
+        reason = await protection_reason(self.db, phone=phone, max_user_id=msg.sender_id)
+        if reason:
             if case_ids and is_new:
                 await self.notifier.notify(
-                    f"Контакт из белого списка ({mask_phone(phone)}) совпал с должником, дело {', '.join(case_ids)}. "
-                    "Автоответа не было — ответьте сами при необходимости.",
+                    f"Номер {mask_phone(phone)} совпал с должником (дело {', '.join(case_ids)}), но защищён: "
+                    f"{reason}. Автоответа не было — ответьте сами или решите в проверке контактов.",
                     kind="whitelist_match",
                 )
             return Decision("whitelist", tuple(case_ids))

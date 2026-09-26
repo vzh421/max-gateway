@@ -157,3 +157,46 @@ class AppState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class Debtor(Base):
+    """Должники (дела) для сопоставления с контактами телефона по ФИО.
+
+    Источник — CSV-выгрузка (case_id, case_number, debtor_name); чтение напрямую из
+    ai4au — после сверки его API (формат ответа и пагинация ещё не проверены).
+    """
+
+    __tablename__ = "debtors"
+
+    case_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    case_number: Mapped[str | None] = mapped_column(String(64))
+    debtor_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = _now()
+
+
+class PhoneContact(Base):
+    """Контакт телефона (Google Контакты) → должник / другой / на проверке.
+
+    Имя хранится только для должников и спорных (нужно для проверки); для остальных —
+    только телефон: им шлюз никогда не отвечает.
+    """
+
+    __tablename__ = "phone_contacts"
+    __table_args__ = (
+        UniqueConstraint("resource_name", "phone", name="uq_phone_contacts_res_phone"),
+        CheckConstraint("status IN ('debtor', 'review', 'other')", name="ck_phone_contacts_status"),
+        CheckConstraint("decided_by IN ('auto', 'manager')", name="ck_phone_contacts_decided_by"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    resource_name: Mapped[str] = mapped_column(String(128), nullable=False)  # people/c123…
+    phone: Mapped[str] = mapped_column(String(11), nullable=False, index=True)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_ids: Mapped[list[str] | None] = mapped_column(JSON)  # должник: дело(а); проверка: кандидаты
+    match_reason: Mapped[str | None] = mapped_column(Text)
+    decided_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    seen_at: Mapped[datetime] = _now()
+    created_at: Mapped[datetime] = _now()

@@ -98,6 +98,30 @@ docker compose run --rm gateway contacts-sync
 ```
 и тоже передать вывод.
 
+### 4а. Контакты телефона и список должников (по `docs/contacts.md`)
+
+1. Список должников для сопоставления по ФИО — CSV `case_id;case_number;debtor_name`.
+   Если на сервере есть доступ к данным ai4au **на чтение** — подготовь выгрузку
+   (без изменений в ai4au!) и загрузи:
+   ```bash
+   docker compose run --rm -v "$PWD/debtors.csv:/tmp/debtors.csv:ro" gateway import-debtors /tmp/debtors.csv
+   ```
+   Для сессии разработки: пришли, если можешь, схему API ai4au (`/openapi.json`, раздел
+   `GET /api/v1/cases/`: параметры пагинации, формат ответа, способ авторизации) — шлюз
+   сможет читать список сам.
+2. Google Контакты: пользователь создаёт OAuth-клиент (шаги — `docs/contacts.md`, раздел 2)
+   и вписывает `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` в `.env`. Затем **сам** выполняет:
+   ```bash
+   docker compose run --rm gateway google-auth
+   ```
+3. Синхронизация:
+   ```bash
+   docker compose run --rm gateway contacts sync
+   docker compose run --rm gateway contacts stats
+   ```
+   Передай пользователю итоговую строку. Файл спорных (`contacts review-export`) содержит
+   полные номера и имена — отдать только пользователю, никуда не копировать.
+
 ### 5. Запуск
 
 ```bash

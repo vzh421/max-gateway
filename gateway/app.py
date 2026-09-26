@@ -69,6 +69,7 @@ async def run_service(settings: Settings, transport: PersonalAccountTransport | 
     api_task = asyncio.create_task(server.serve(), name="api")
     transport_task = asyncio.create_task(_run_transport(transport, core, monitor), name="transport")
     digest_task = asyncio.create_task(notifier.run(), name="digest")
+    contacts_task = asyncio.create_task(_contacts_loop(settings, db, notifier), name="contacts")
     try:
         # Процесс живёт, пока жив служебный API (до SIGTERM). Падение транспорта процесс
         # НЕ завершает: иначе restart-политика Docker переподключала бы личный аккаунт к MAX
@@ -80,8 +81,9 @@ async def run_service(settings: Settings, transport: PersonalAccountTransport | 
         await core.cancel_pending()  # незавершённые отправки не выполняем при остановке
         server.should_exit = True
         transport_task.cancel()
+        contacts_task.cancel()
         digest_task.cancel()  # при отмене сводка сбрасывается (DigestNotifier.run → flush)
-        await asyncio.gather(api_task, transport_task, digest_task, return_exceptions=True)
+        await asyncio.gather(api_task, transport_task, contacts_task, digest_task, return_exceptions=True)
         if isinstance(base_notifier, BotApiNotifier):
             await base_notifier.aclose()
         await db.dispose()
@@ -98,3 +100,32 @@ async def _run_transport(transport: PersonalAccountTransport, core: Core, monito
         await monitor.on_status(StatusEvent(status, f"{type(e).__name__}: {e}"))
         return
     log.warning("Транспорт %s завершил работу; приём сообщений остановлен до перезапуска", transport.name)
+
+
+async def _contacts_loop(settings: Settings, db: Database, notifier: Notifier) -> None:
+    """Периодическая синхронизация контактов телефона (если настроен Google)."""
+    if not settings.contacts_sync_hours or not settings.google_client_id or not settings.google_client_secret:
+        log.info("Автосинхронизация контактов выключена")
+        return
+    from .contacts import sync_contacts
+    from .google_contacts import load_google_contacts
+
+    while True:
+        try:
+            contacts = await load_google_contacts(
+                settings.google_client_id, settings.google_client_secret.get_secret_value(), settings.google_token_file
+            )
+            report = await sync_contacts(db, contacts)
+            log.info("Контакты синхронизированы: %s", report.summary())
+            if report.new_review:
+                await notifier.notify(
+                    f"В контактах телефона {report.new_review} новых спорных совпадений с должниками. "
+                    "Проверка: python -m gateway contacts review-export review.csv",
+                    kind="contacts_review",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — сбой синхронизации не останавливает шлюз
+            log.error("Синхронизация контактов не удалась: %s: %s", type(e).__name__, e)
+            await notifier.notify(f"Синхронизация контактов телефона не удалась: {type(e).__name__}", kind="contacts_error")
+        await asyncio.sleep(settings.contacts_sync_hours * 3600)

@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     # Несрочные уведомления копятся и уходят сводкой раз в N минут.
     notify_digest_minutes: float = Field(default=60, gt=0)
 
+    # --- Контакты телефона (Google Контакты, только чтение) ---
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    google_token_file: Path = Path("/data/google_token.json")
+    # Как часто сервис сам синхронизирует контакты; 0 — только вручную (contacts sync).
+    contacts_sync_hours: float = Field(default=24, ge=0)
+
     # --- Служебный API ---
     api_host: str = "127.0.0.1"  # в docker compose — 0.0.0.0, порт проброшен только на 127.0.0.1
     api_port: int = 8080
