@@ -331,17 +331,33 @@ async def import_review(db: Database, path: Path) -> ImportReport:
             elif decision in DECISION_DEBTOR:
                 case_id = row.get("case_id", "").strip()
                 cands = pc.case_ids or []
-                if not case_id and len(cands) == 1:
-                    case_id = cands[0]
-                if not case_id or await s.get(Debtor, case_id) is None and case_id not in cands:
-                    report.errors.append(f"строка {i}: для «должник» укажите case_id одного из кандидатов")
+                if case_id:
+                    if case_id not in cands and await s.get(Debtor, case_id) is None:
+                        report.errors.append(f"строка {i}: дело {case_id} не найдено среди должников")
+                        continue
+                    chosen = [case_id]
+                elif cands:
+                    # Без case_id — все кандидаты: дело должник выберет в боте (как любой номер
+                    # с несколькими делами, S1 п.5).
+                    chosen = list(cands)
+                else:
+                    report.errors.append(f"строка {i}: для «должник» укажите case_id (номер дела)")
                     continue
-                pc.status, pc.case_ids = DEBTOR, [case_id]
-                exists = await s.scalar(
-                    select(DebtorPhone.id).where(DebtorPhone.case_id == case_id, DebtorPhone.phone == pc.phone)
+                pc.status, pc.case_ids = DEBTOR, chosen
+                # Связи номера с делами, которые управляющий не выбрал, из авто-источников убираем.
+                await s.execute(
+                    delete(DebtorPhone).where(
+                        DebtorPhone.phone == pc.phone,
+                        DebtorPhone.case_id.not_in(chosen),
+                        DebtorPhone.source.in_(("manager_review", "google_csv")),
+                    )
                 )
-                if not exists:
-                    s.add(DebtorPhone(case_id=case_id, phone=pc.phone, source="manager_review", created_at=now))
+                for cid in chosen:
+                    exists = await s.scalar(
+                        select(DebtorPhone.id).where(DebtorPhone.case_id == cid, DebtorPhone.phone == pc.phone)
+                    )
+                    if not exists:
+                        s.add(DebtorPhone(case_id=cid, phone=pc.phone, source="manager_review", created_at=now))
             else:
                 report.errors.append(f"строка {i}: решение «{decision}» не распознано (должник / не должник)")
                 continue

@@ -129,7 +129,7 @@ async def test_manager_decision_survives_resync_and_removal(db, tmp_path: Path) 
     assert r4.removed == 1 and "79162222222" not in await _statuses(db)
 
 
-async def test_review_import_requires_case_for_several_candidates(db, tmp_path: Path) -> None:
+async def test_review_import_several_candidates(db, tmp_path: Path) -> None:
     await _debtors(db, ("C1", "Петров Пётр Петрович"), ("C2", "Петров Пётр Петрович"))
     await sync_contacts(db, [rc("people/1", "Петров Пётр Петрович", "+79161111111")])
     f = tmp_path / "r.csv"
@@ -137,12 +137,21 @@ async def test_review_import_requires_case_for_several_candidates(db, tmp_path: 
     header, row = f.read_text(encoding="utf-8-sig").splitlines()[:2]
     cols = row.split(";")
     cols[5] = "должник"
+    # без case_id — должник по всем кандидатам (выбор дела в боте)
     f.write_text(header + "\n" + ";".join(cols), encoding="utf-8-sig")
-    assert (await import_review(db, f)).errors  # case_id не указан
+    assert not (await import_review(db, f)).errors
+    assert (await _statuses(db))["79161111111"][2] == ["C1", "C2"]
+    # с case_id — только это дело; неизвестное дело — ошибка
+    cols[6] = "C9"
+    f.write_text(header + "\n" + ";".join(cols), encoding="utf-8-sig")
+    assert (await import_review(db, f)).errors
     cols[6] = "C2"
     f.write_text(header + "\n" + ";".join(cols), encoding="utf-8-sig")
     assert not (await import_review(db, f)).errors
     assert (await _statuses(db))["79161111111"][2] == ["C2"]
+    async with db.session() as s:
+        cases = (await s.execute(select(DebtorPhone.case_id).where(DebtorPhone.phone == "79161111111"))).scalars().all()
+    assert cases == ["C2"]  # лишняя связь с C1 снята
 
 
 async def test_import_debtors_csv(db, tmp_path: Path) -> None:
