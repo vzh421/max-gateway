@@ -1,4 +1,4 @@
-"""Контакты телефона: кто должник (направлять в бот), кто нет (не отвечать никогда).
+"""Контакты телефона (CSV-экспорт Google Контактов): кто должник, кто нет.
 
 Классификация каждого номера из контактов:
 - **debtor** — номер уже есть в debtor_phones ИЛИ ФИО контакта точно совпало ровно с
@@ -107,8 +107,15 @@ class DebtorIndex:
         return Classified(OTHER)
 
 
-async def sync_contacts(db: Database, contacts: list[RawContact], *, source: str = "google_contacts") -> SyncReport:
-    """Полная синхронизация: список contacts — все контакты телефона на сейчас."""
+async def sync_contacts(
+    db: Database, contacts: list[RawContact], *, source: str = "google_csv", remove_missing: bool = False
+) -> SyncReport:
+    """Загрузка контактов телефона.
+
+    remove_missing=True — файл считается ПОЛНЫМ списком: номера, которых в нём нет, удаляются
+    из классификации (и перестают быть защищены как «контакт телефона»). По умолчанию —
+    только добавление/обновление: частичный файл не снимает защиту с остальных.
+    """
     index = await DebtorIndex.load(db)
     report = SyncReport(contacts=len(contacts))
     now = utcnow()
@@ -159,7 +166,7 @@ async def sync_contacts(db: Database, contacts: list[RawContact], *, source: str
                             known_debtor_phones.add((case_id, phone))
                             report.new_debtor_phones += 1
         # Контакты, удалённые из телефона, больше не защищаются и не считаются должниками.
-        gone = [r.id for k, r in existing.items() if k not in seen]
+        gone = [r.id for k, r in existing.items() if k not in seen] if remove_missing else []
         if gone:
             await s.execute(delete(PhoneContact).where(PhoneContact.id.in_(gone)))
         report.removed = len(gone)

@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import json
-import os
-import stat
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
 from sqlalchemy import select
 
@@ -25,15 +20,7 @@ from gateway.contacts import (
 )
 from gateway.db import utcnow
 from gateway.db.models import Debtor, DebtorPhone, PhoneContact
-from gateway.google_contacts import (
-    GoogleAuthError,
-    exchange_code,
-    fetch_contacts,
-    make_auth_request,
-    parse_redirect,
-    person_to_contact,
-    save_refresh_token,
-)
+from gateway.google_csv import GoogleCsvError, parse_google_csv
 from gateway.importers import add_whitelist
 from gateway.names import Match, match
 
@@ -99,7 +86,7 @@ async def test_sync_classifies_and_minimizes_pii(db) -> None:
     assert report.bad_phones == 1 and report.new_debtor_phones == 1 and report.new_review == 2
     async with db.session() as s:
         dp = (await s.execute(select(DebtorPhone.case_id, DebtorPhone.phone, DebtorPhone.source))).all()
-    assert dp == [("C1", "79161111111", "google_contacts")]
+    assert dp == [("C1", "79161111111", "google_csv")]
 
 
 async def test_phone_already_in_registry_is_debtor(db) -> None:
@@ -132,9 +119,10 @@ async def test_manager_decision_survives_resync_and_removal(db, tmp_path: Path) 
     r2 = await sync_contacts(db, contacts)
     assert r2.kept_manager_decisions == 2
     assert (await _statuses(db))["79161111111"][0] == DEBTOR
-    # контакт удалили из телефона — запись уходит
-    r3 = await sync_contacts(db, contacts[:1])
-    assert r3.removed == 1 and "79162222222" not in await _statuses(db)
+    r3 = await sync_contacts(db, contacts[:1])  # частичный файл ничего не удаляет
+    assert r3.removed == 0 and "79162222222" in await _statuses(db)
+    r4 = await sync_contacts(db, contacts[:1], remove_missing=True)  # полный список (--replace)
+    assert r4.removed == 1 and "79162222222" not in await _statuses(db)
 
 
 async def test_review_import_requires_case_for_several_candidates(db, tmp_path: Path) -> None:
@@ -219,65 +207,54 @@ async def test_s1_other_or_review_contact_no_reply(db, tmp_path: Path, name) -> 
     assert e.transport.sent == [] and "whitelist_match" in e.notifier.kinds()
 
 
-# --- Google ---
+# --- CSV-экспорт Google Контактов ---
 
-def test_auth_request_has_pkce_and_readonly_scope() -> None:
-    url, verifier, state = make_auth_request("cid")
-    q = parse_qs(urlparse(url).query)
-    assert q["scope"] == ["https://www.googleapis.com/auth/contacts.readonly"]
-    assert q["code_challenge_method"] == ["S256"] and q["state"] == [state] and q["access_type"] == ["offline"]
-    assert len(verifier) >= 43
-
-
-def test_parse_redirect() -> None:
-    assert parse_redirect("http://127.0.0.1:8765/?state=s&code=abc&scope=x", "s") == "abc"
-    with pytest.raises(GoogleAuthError):
-        parse_redirect("http://127.0.0.1:8765/?state=other&code=abc", "s")
-    with pytest.raises(GoogleAuthError):
-        parse_redirect("http://127.0.0.1:8765/?error=access_denied&state=s", "s")
+# Набор и порядок колонок — как в реальном экспорте управляющего (без данных).
+HEADERS = (
+    "First Name,Middle Name,Last Name,Phonetic First Name,Phonetic Middle Name,Phonetic Last Name,"
+    "Name Prefix,Name Suffix,Nickname,File As,Organization Name,Organization Title,Organization Department,"
+    "Birthday,Notes,Photo,Labels,E-mail 1 - Label,E-mail 1 - Value,E-mail 2 - Label,E-mail 2 - Value,"
+    + ",".join(f"Phone {i} - Label,Phone {i} - Value" for i in range(1, 8))
+)
 
 
-async def test_exchange_without_refresh_token_fails() -> None:
-    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"access_token": "a"})))
-    with pytest.raises(GoogleAuthError, match="refresh_token"):
-        await exchange_code(client, "id", "secret", "code", "verifier")
+def _row(first="", middle="", last="", phones=("", "")) -> str:
+    cols = [""] * len(HEADERS.split(","))
+    idx = {h: i for i, h in enumerate(HEADERS.split(","))}
+    cols[idx["First Name"]], cols[idx["Middle Name"]], cols[idx["Last Name"]] = first, middle, last
+    cols[idx["Labels"]] = "* myContacts"
+    cols[idx["Phone 1 - Value"]], cols[idx["Phone 2 - Value"]] = phones
+    return ",".join(f'"{c}"' for c in cols)
 
 
-def test_person_to_contact() -> None:
-    p = {
-        "resourceName": "people/c1",
-        "names": [{"displayName": "Иван Иванов", "familyName": "Иванов", "givenName": "Иван", "middleName": "Иванович"}],
-        "phoneNumbers": [{"value": "8 (916) 111-11-11", "canonicalForm": "+79161111111"}, {"value": "+7 916 222 22 22"}],
-    }
-    c = person_to_contact(p)
-    assert c.names == ("Иван Иванов", "Иванов Иван Иванович")
-    assert c.phones == ("+79161111111", "+7 916 222 22 22")
-    assert person_to_contact({"resourceName": "people/c2", "names": [{"displayName": "X"}]}) is None
+def test_parse_google_csv_real_layout() -> None:
+    text = "\n".join([
+        HEADERS,
+        _row("Иван", "Иванович", "Иванов", ("+7 916 111-11-11 ::: 8\u00a0(916)\u00a0222-22-22", "")),
+        _row("Иван Иванов", "", "", ("+79161111111", "")),  # тот же номер — имена объединяются
+        _row("Такси", "", "", ("", "")),  # без телефона
+        _row("Мастер", "", "", ("123-45", "+1 202 555 0100")),  # короткий и иностранный
+    ])
+    contacts, bad = parse_google_csv(text)
+    by = {c.phones[0]: c.names for c in contacts}
+    assert by["+79161111111"] == ("Иванов Иван Иванович", "Иван Иванов")
+    assert by["+79162222222"] == ("Иванов Иван Иванович",)
+    assert bad == 2 and len(contacts) == 2
 
 
-async def test_fetch_contacts_paginates() -> None:
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(dict(request.url.params))
-        assert request.headers["Authorization"] == "Bearer tok"
-        if "pageToken" not in request.url.params:
-            return httpx.Response(200, json={"connections": [
-                {"resourceName": "people/1", "names": [{"displayName": "А"}], "phoneNumbers": [{"value": "+79161111111"}]}
-            ], "nextPageToken": "p2"})
-        return httpx.Response(200, json={"connections": [
-            {"resourceName": "people/2", "names": [{"displayName": "Б"}], "phoneNumbers": [{"value": "+79162222222"}]}
-        ]})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    contacts = await fetch_contacts(client, "tok")
-    assert [c.resource_name for c in contacts] == ["people/1", "people/2"]
-    assert calls[0]["personFields"] == "names,phoneNumbers" and calls[0]["pageSize"] == "1000"
-    assert calls[1]["pageToken"] == "p2"
+def test_parse_google_csv_unknown_layout_refused() -> None:
+    with pytest.raises(GoogleCsvError, match="Phone 1 - Value"):
+        parse_google_csv("Имя,Телефон\nИван,+79161111111\n")
 
 
-def test_refresh_token_file_is_private(tmp_path: Path) -> None:
-    f = tmp_path / "g" / "token.json"
-    save_refresh_token(f, "rt")
-    assert stat.S_IMODE(os.stat(f).st_mode) == 0o600
-    assert json.loads(f.read_text())["refresh_token"] == "rt"
+async def test_csv_import_end_to_end(db, tmp_path: Path) -> None:
+    from gateway.google_csv import load_google_csv
+
+    await _debtors(db, ("C1", "Иванов Иван Иванович"))
+    f = tmp_path / "contacts.csv"
+    f.write_text("\n".join([HEADERS, _row("Иван", "Иванович", "Иванов", ("+7 916 111-11-11", "")),
+                             _row("Жена", "", "", ("+7 916 333-33-33", ""))]), encoding="utf-8")
+    contacts, _ = load_google_csv(f)
+    await sync_contacts(db, contacts)
+    st = await _statuses(db)
+    assert st["79161111111"][0] == DEBTOR and st["79163333333"][0] == OTHER

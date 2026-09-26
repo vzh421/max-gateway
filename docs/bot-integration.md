@@ -90,8 +90,7 @@ https://max.ru/<BOT_USERNAME>?start=<token>
   `NOTIFY_DIGEST_MINUTES` (по умолчанию 60).
 - `text` — готовый текст на русском. Телефоны, ИНН и СНИЛС в нём уже маскированы.
 - `kind` (информационно): `monitor`, `digest`, а внутри сводки события: `unknown`,
-  `whitelist_match`, `redirect_first`, `redirect_reminder`, `redirect_limit`, `error`, `config`,
-  `contacts_review` (новые спорные контакты), `contacts_error` (сбой синхронизации контактов).
+  `whitelist_match`, `redirect_first`, `redirect_reminder`, `redirect_limit`, `error`, `config`.
 - Кому в боте доставлять (id чата управляющего) — решает сессия бота.
 
 ## 4. Сеть

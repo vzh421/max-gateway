@@ -109,18 +109,15 @@ docker compose run --rm gateway contacts-sync
    Для сессии разработки: пришли, если можешь, схему API ai4au (`/openapi.json`, раздел
    `GET /api/v1/cases/`: параметры пагинации, формат ответа, способ авторизации) — шлюз
    сможет читать список сам.
-2. Google Контакты: пользователь создаёт OAuth-клиент (шаги — `docs/contacts.md`, раздел 2)
-   и вписывает `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` в `.env`. Затем **сам** выполняет:
+2. **После** списка должников (п. 1) — контакты телефона: пользователь выгружает их из contacts.google.com в формате «Google CSV»
+   и передаёт файл на сервер. Загрузить и сразу удалить файл:
    ```bash
-   docker compose run --rm gateway google-auth
-   ```
-3. Синхронизация:
-   ```bash
-   docker compose run --rm gateway contacts sync
+   docker compose run --rm -v "$PWD/contacts.csv:/tmp/contacts.csv:ro" gateway contacts import /tmp/contacts.csv
+   shred -u contacts.csv 2>/dev/null || rm -f contacts.csv
    docker compose run --rm gateway contacts stats
    ```
-   Передай пользователю итоговую строку. Файл спорных (`contacts review-export`) содержит
-   полные номера и имена — отдать только пользователю, никуда не копировать.
+   Передай пользователю итоговую строку. Содержимое файла не выводить. Файл спорных
+   (`contacts review-export`) содержит полные номера и имена — отдать только пользователю.
 
 ### 5. Запуск
 
