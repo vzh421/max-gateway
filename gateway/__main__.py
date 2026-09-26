@@ -7,7 +7,7 @@
   import-phones FILE      импорт телефонов должников из CSV (case_id, phone[, note])
   whitelist add PHONE     добавить номер в белый список
   whitelist list          показать белый список (номера маскированы)
-  import-debtors FILE     список должников из CSV (case_id, debtor_name[, case_number])
+  import-debtors FILE     список должников: case-map.json или CSV (case_id, debtor_name[, case_number])
   contacts import FILE [--replace]   контакты телефона из CSV-экспорта Google Контактов:
                           разделить на должников / остальных / спорных
   contacts review-export FILE   спорные — в CSV для проверки (открывается в Excel)
@@ -105,14 +105,24 @@ async def cmd_whitelist(args: argparse.Namespace) -> int:
 
 
 async def cmd_import_debtors(args: argparse.Namespace) -> int:
-    from .contacts import import_debtors_csv
+    from .contacts import import_case_map, import_debtors_csv
 
     db = Database(get_settings().database_url)
+    path = Path(args.file)
     try:
-        report = await import_debtors_csv(db, Path(args.file), args.source)
+        if path.suffix.lower() == ".json":
+            try:
+                report, skipped = await import_case_map(db, path)
+            except ValueError as e:
+                print(f"Файл не распознан: {e}")
+                return 2
+            print("Пропущено:", ", ".join(f"{k}: {v}" for k, v in skipped.items()))
+        else:
+            report = await import_debtors_csv(db, path, args.source)
     finally:
         await db.dispose()
     print("Должники:", report.summary().replace("уже были", "обновлено"))
+    print("После обновления списка должников загрузите контакты заново: contacts import <файл>")
     return 0 if not report.errors else 1
 
 

@@ -204,28 +204,75 @@ async def protection_reason(db: Database, *, phone: str | None, max_user_id: int
 
 # --- должники из CSV ---
 
-async def import_debtors_csv(db: Database, path: Path, source: str | None = None) -> ImportReport:
-    """Колонки: case_id, debtor_name; необязательно case_number. Повтор — обновление."""
-    report = ImportReport()
-    rows = _read_csv(path)
+async def _upsert_debtors(db: Database, rows: list[tuple[str, str | None, str]], source: str, report: ImportReport) -> None:
     now = utcnow()
     async with db.session() as s, s.begin():
-        for i, row in enumerate(rows, start=2):
-            report.total_rows += 1
-            case_id, name = row.get("case_id", ""), row.get("debtor_name", "")
-            if not case_id or not tokens(name):
-                report.errors.append(f"строка {i}: нет case_id или debtor_name")
-                continue
+        for case_id, case_number, name in rows:
             existing = await s.get(Debtor, case_id)
             if existing:
-                existing.debtor_name, existing.case_number = name, row.get("case_number") or existing.case_number
+                existing.debtor_name, existing.case_number = name, case_number or existing.case_number
                 existing.updated_at = now
                 report.duplicates += 1
             else:
-                s.add(Debtor(case_id=case_id, case_number=row.get("case_number") or None, debtor_name=name,
-                             source=source or f"csv:{path.name}", updated_at=now))
+                s.add(Debtor(case_id=case_id, case_number=case_number, debtor_name=name, source=source, updated_at=now))
                 report.added += 1
+
+
+async def import_debtors_csv(db: Database, path: Path, source: str | None = None) -> ImportReport:
+    """Колонки: case_id, debtor_name; необязательно case_number. Повтор — обновление."""
+    report = ImportReport()
+    rows: list[tuple[str, str | None, str]] = []
+    for i, row in enumerate(_read_csv(path), start=2):
+        report.total_rows += 1
+        case_id, name = row.get("case_id", ""), row.get("debtor_name", "")
+        if not case_id or not tokens(name):
+            report.errors.append(f"строка {i}: нет case_id или debtor_name")
+            continue
+        rows.append((case_id, row.get("case_number") or None, name))
+    await _upsert_debtors(db, rows, source or f"csv:{path.name}", report)
     return report
+
+
+# Формат case-map.json (сверен по файлу управляющего, version 1):
+# {"version": 1, "updated_at": "...", "cases": {"<номер дела>": {"path": "_БФЛ/<ФИО>",
+#   "type": "BFL"|"BYUL"|"OTHER", "case_type", "case_subtype", "status", "main_case", ...}}}
+CASEMAP_PERSON_TYPE = "BFL"
+
+
+def parse_case_map(data: dict) -> tuple[list[tuple[str, str | None, str]], dict[str, int]]:
+    """→ (строки (case_id, case_number, ФИО), счётчики пропусков).
+
+    Берутся только банкротства физлиц (type=BFL, путь «_БФЛ/<ФИО>»): с контактами телефона
+    сопоставляются люди. case_id = номер дела (в файле нет id ai4au).
+    """
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("cases"), dict):
+        raise ValueError("Не похоже на case-map.json версии 1 (нужны version=1 и cases)")
+    rows: list[tuple[str, str | None, str]] = []
+    skipped = {"не физлицо": 0, "нестандартный путь": 0, "нет ФИО": 0}
+    for number, case in data["cases"].items():
+        if not isinstance(case, dict) or case.get("type") != CASEMAP_PERSON_TYPE:
+            skipped["не физлицо"] += 1
+            continue
+        parts = str(case.get("path", "")).split("/")
+        if len(parts) != 2:
+            skipped["нестандартный путь"] += 1
+            continue
+        name = parts[1].strip()
+        if not tokens(name):
+            skipped["нет ФИО"] += 1
+            continue
+        rows.append((number.strip(), number.strip(), name))
+    return rows, skipped
+
+
+async def import_case_map(db: Database, path: Path) -> tuple[ImportReport, dict[str, int]]:
+    import json
+
+    report = ImportReport()
+    rows, skipped = parse_case_map(json.loads(path.read_text(encoding="utf-8")))
+    report.total_rows = len(rows) + sum(skipped.values())
+    await _upsert_debtors(db, rows, f"case-map:{path.name}", report)
+    return report, skipped
 
 
 # --- проверка спорных управляющим (CSV, открывается в Excel) ---
@@ -266,12 +313,18 @@ async def import_review(db: Database, path: Path) -> ImportReport:
             if not decision:
                 continue
             report.total_rows += 1
-            try:
-                pc = await s.get(PhoneContact, int(row.get("id", "")))
-            except ValueError:
-                pc = None
+            # Ключ — номер телефона: файл, заполненный по одной базе, можно загрузить в другую
+            # (id записей у разных баз разные). id — только если номера нет.
+            phone = normalize_phone(row.get("телефон", ""))
+            if phone:
+                pc = await s.scalar(select(PhoneContact).where(PhoneContact.phone == phone).limit(1))
+            else:
+                try:
+                    pc = await s.get(PhoneContact, int(row.get("id", "")))
+                except ValueError:
+                    pc = None
             if pc is None:
-                report.errors.append(f"строка {i}: нет записи с таким id")
+                report.errors.append(f"строка {i}: номер не найден среди загруженных контактов")
                 continue
             if decision in DECISION_OTHER:
                 pc.status, pc.case_ids = OTHER, None

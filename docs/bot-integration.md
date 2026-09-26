@@ -38,7 +38,7 @@ https://max.ru/<BOT_USERNAME>?start=<token>
 ```json
 {
   "status": "valid",
-  "case_id": "A40-1234/2025",
+  "case_id": "А40-1234/2025",
   "candidate_case_ids": [],
   "expires_at": "2026-10-10T09:00:00+00:00",
   "used_at": null
@@ -46,7 +46,9 @@ https://max.ru/<BOT_USERNAME>?start=<token>
 ```
 
 - `status`: `valid` | `used` | `expired`. Неизвестный или некорректный токен — `404`.
-- `case_id` — id дела в ai4au (строка), если номер найден ровно в одном деле.
+- `case_id` — **номер дела в суде** (строка, например `А40-1234/2025`), если телефон найден
+  ровно в одном деле. Источник списка дел — карта дел `case-map.json`, где id ai4au нет; в ai4au
+  это поле `case_number`. Если позже шлюз перейдёт на id ai4au — только по согласованию (v2).
 - `candidate_case_ids` — если номер телефона найден в **нескольких** делах: `case_id = null`,
   выбор дела — в боте.
 - `case_id = null` и пустой `candidate_case_ids` — дело не определено (включается только

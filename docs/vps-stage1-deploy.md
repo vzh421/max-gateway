@@ -100,15 +100,14 @@ docker compose run --rm gateway contacts-sync
 
 ### 4а. Контакты телефона и список должников (по `docs/contacts.md`)
 
-1. Список должников для сопоставления по ФИО — CSV `case_id;case_number;debtor_name`.
-   Если на сервере есть доступ к данным ai4au **на чтение** — подготовь выгрузку
-   (без изменений в ai4au!) и загрузи:
+1. Список должников — файл `case-map.json` (карта дел; пользователь передаст его или
+   укажет, где он лежит на сервере). Загрузить:
    ```bash
-   docker compose run --rm -v "$PWD/debtors.csv:/tmp/debtors.csv:ro" gateway import-debtors /tmp/debtors.csv
+   docker compose run --rm -v "$PWD/case-map.json:/tmp/case-map.json:ro" gateway import-debtors /tmp/case-map.json
    ```
    Для сессии разработки: пришли, если можешь, схему API ai4au (`/openapi.json`, раздел
-   `GET /api/v1/cases/`: параметры пагинации, формат ответа, способ авторизации) — шлюз
-   сможет читать список сам.
+   `GET /api/v1/cases/`: параметры пагинации, формат ответа, способ авторизации) — нужно
+   для сверки списка с ai4au.
 2. **После** списка должников (п. 1) — контакты телефона: пользователь выгружает их из contacts.google.com в формате «Google CSV»
    и передаёт файл на сервер. Загрузить и сразу удалить файл:
    ```bash

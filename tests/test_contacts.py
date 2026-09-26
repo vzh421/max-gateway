@@ -42,6 +42,10 @@ from .test_core import CASE, PHONE, Env
         ("Иванов", "Иванов Иван Иванович", Match.NONE),  # одна фамилия — не совпадение
         ("Иван сантехник", "Иванов Иван Иванович", Match.NONE),
         ("Иванов П.И.", "Иванов Иван Иванович", Match.NONE),  # инициалы не те
+        ("Иван Иванович", "Иванов Иван Иванович", Match.NONE),  # без фамилии — шум
+        ("Петров Иван Иванович", "Иванов Иван Иванович", Match.NONE),  # другая фамилия
+        ("Иван Иванов", "Иванов Иван Иванович", Match.PARTIAL),  # фамилия + имя, порядок любой
+        ("Мамедов Али Гусейн оглы", "Мамедов Али Гусейн оглы", Match.EXACT),
         ("Петров Пётр Петрович", "Иванов Иван Иванович", Match.NONE),
         ("", "Иванов Иван Иванович", Match.NONE),
     ],
@@ -258,3 +262,34 @@ async def test_csv_import_end_to_end(db, tmp_path: Path) -> None:
     await sync_contacts(db, contacts)
     st = await _statuses(db)
     assert st["79161111111"][0] == DEBTOR and st["79163333333"][0] == OTHER
+
+
+async def test_review_import_keyed_by_phone_not_id(db, tmp_path: Path) -> None:
+    """Файл, заполненный по одной базе, загружается в другую: id другие, номер тот же."""
+    await _debtors(db, ("C1", "Иванов Иван Иванович"))
+    await sync_contacts(db, [rc("people/1", "Иванов Иван", "+79161111111")])
+    f = tmp_path / "r.csv"
+    await export_review(db, f)
+    header, row = f.read_text(encoding="utf-8-sig").splitlines()[:2]
+    cols = row.split(";")
+    cols[0], cols[5] = "999999", "должник"
+    f.write_text(header + "\n" + ";".join(cols), encoding="utf-8-sig")
+    report = await import_review(db, f)
+    assert report.added == 1 and not report.errors
+    assert (await _statuses(db))["79161111111"][0] == DEBTOR
+
+
+async def test_case_map_parsing() -> None:
+    from gateway.contacts import parse_case_map
+
+    data = {"version": 1, "updated_at": "x", "cases": {
+        "А40-1/2025": {"path": "_БФЛ/Иванов Иван Иванович", "type": "BFL"},
+        "А40-2/2025": {"path": "_БЮЛ/ООО Ромашка", "type": "BYUL"},
+        "А40-3/2025": {"path": "_БЮЛ/ООО Ромашка/Обособленный спор/А40-3_2025", "type": "BYUL"},
+        "А40-4/2025": {"path": "_БФЛ/", "type": "BFL"},
+    }}
+    rows, skipped = parse_case_map(data)
+    assert rows == [("А40-1/2025", "А40-1/2025", "Иванов Иван Иванович")]
+    assert skipped == {"не физлицо": 2, "нестандартный путь": 0, "нет ФИО": 1}
+    with pytest.raises(ValueError):
+        parse_case_map({"version": 2, "cases": {}})
