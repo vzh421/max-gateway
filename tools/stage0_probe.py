@@ -143,7 +143,7 @@ class Recorder:
 def contacts_summary(client: Client) -> dict[str, Any]:
     contacts = [c for c in (client.contacts or []) if c is not None]
     with_phone = sum(1 for c in contacts if getattr(c, "phone", None))
-    sample = contacts[0].model_dump(mode="json") if contacts else None
+    sample = contacts[0].model_dump(mode="python") if contacts else None
     return {
         "contacts_total": len(contacts),
         "contacts_with_phone": with_phone,
@@ -219,7 +219,8 @@ async def run_listen(args: argparse.Namespace) -> None:
         out.write(
             "message",
             {
-                "model": message.model_dump(mode="json"),
+                # mode="python": в mode="json" pydantic падает на bytes (thumbhash, previewData фото)
+                "model": message.model_dump(mode="python"),
                 "is_own": message.sender is not None and message.sender == my_id,
                 "chat_id_xor_check": (my_id ^ message.sender) if (my_id and message.sender) else None,
             },
@@ -231,7 +232,7 @@ async def run_listen(args: argparse.Namespace) -> None:
             looked_up.add(message.sender)
             try:
                 user = await c.get_user(message.sender)
-                out.write("lookup_user", user.model_dump(mode="json") if user else None)
+                out.write("lookup_user", user.model_dump(mode="python") if user else None)
             except Exception as e:  # noqa: BLE001
                 out.write("lookup_user_error", {"error": type(e).__name__, "detail": str(e)})
         if message.chat_id is not None:
