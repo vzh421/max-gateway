@@ -115,6 +115,14 @@ ai4au — FastAPI backend, `https://ai4au.ru`. Известные эндпоин
   `birth_date`, `attributes_jsonb`).
 - `PUT /api/v1/cases/{case_id}/debtor` — upsert карточки (НЕ вызывать без согласования).
 
+Сверено по openapi на сервере (AI4AU API (DRAFT) 0.1.0-draft, на VPS доступен на 127.0.0.1:8000):
+- авторизация — `Authorization: Bearer <token>`; для сервисов — сервисный токен
+  (`GET|POST /api/v1/auth/service-tokens`, отзыв `DELETE /api/v1/auth/service-tokens/{token_id}`);
+  создаёт его управляющий сам и кладёт в `.env` сервера (`AI4AU_API_TOKEN`), не в чат;
+- `GET /api/v1/cases/` — пагинация `skip`/`limit`; фильтры `q`, `status`, `court_name`,
+  `procedure_type`, `has_fedresurs`, `has_newspaper`, `only_next_procedure`,
+  `only_kad_terminated`; сортировка `sort_by`, `sort_dir`. Формат ответа ещё не сверен.
+
 **Телефонов должников в ai4au сейчас нет.** Поэтому в сервисе своя таблица
 `debtor_phones` (case_id, phone в формате 7XXXXXXXXXX, источник, дата). Заполнение:
 импорт CSV + служебный эндпоинт. Перенос телефонов в ai4au — отдельное решение позже.
