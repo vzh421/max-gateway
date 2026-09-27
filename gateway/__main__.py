@@ -13,6 +13,7 @@
   contacts review-export FILE   спорные — в CSV для проверки (открывается в Excel)
   contacts review-import FILE   загрузить решения («должник» / «не должник»)
   contacts stats          сколько контактов в каждой группе
+  history-export FILE     выгрузить обезличенную переписку с должниками (только чтение; сервис остановить)
   kill on|off|status      аварийный выключатель отправок
   sends status|resume     блокировка отправок мониторингом
 """
@@ -167,6 +168,48 @@ async def cmd_contacts(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_history_export(args: argparse.Namespace) -> int:
+    from collections import defaultdict
+
+    from sqlalchemy import select as sa_select
+
+    from .db.models import Debtor, DebtorPhone
+    from .history_export import export_history
+    from .transport.pymax_transport import run_readonly
+
+    settings = get_settings()
+    if settings.max_phone is None:
+        print("MAX_PHONE не задан в .env")
+        return 2
+    db = Database(settings.database_url)
+    try:
+        async with db.session() as s:
+            phones: dict[str, list[str]] = defaultdict(list)
+            for case_id, phone in (await s.execute(sa_select(DebtorPhone.case_id, DebtorPhone.phone))).all():
+                phones[phone].append(case_id)
+            names = {d.case_id: d.debtor_name for d in (await s.execute(sa_select(Debtor))).scalars()}
+    finally:
+        await db.dispose()
+    if not phones:
+        print("Реестр телефонов должников пуст — сначала import-debtors и contacts import")
+        return 2
+    out = Path(args.file)
+
+    async def job(reader):  # type: ignore[no-untyped-def]
+        return await export_history(
+            reader, dict(phones), names, out,
+            manager_names=args.manager_name or [], per_chat=args.per_chat, max_chats=args.max_chats,
+        )
+
+    report = await run_readonly(settings.max_phone.get_secret_value(), settings.session_dir, job)
+    import os
+
+    os.chmod(out, 0o600)
+    print("Выгрузка:", report.summary())
+    print(f"Файл: {out} (персональные данные — только управляющему)")
+    return 0
+
+
 def cmd_kill(args: argparse.Namespace) -> int:
     settings = get_settings()
     ks = KillSwitch(settings.kill_switch, settings.kill_switch_file)
@@ -218,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("action", choices=["import", "review-export", "review-import", "stats"])
     p.add_argument("file", nargs="?")
     p.add_argument("--replace", action="store_true", help="файл — полный список: удалить номера, которых в нём нет")
+    p = sub.add_parser("history-export")
+    p.add_argument("file")
+    p.add_argument("--per-chat", type=int, default=200)
+    p.add_argument("--max-chats", type=int, default=300)
+    p.add_argument("--manager-name", action="append", help="ФИО управляющего для замены в текстах (можно несколько)")
     p = sub.add_parser("kill")
     p.add_argument("action", choices=["on", "off", "status"])
     p.add_argument("--note", default=None)
@@ -251,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_import_debtors(args))
     if args.cmd == "contacts":
         return asyncio.run(cmd_contacts(args))
+    if args.cmd == "history-export":
+        return asyncio.run(cmd_history_export(args))
     if args.cmd == "kill":
         return cmd_kill(args)
     if args.cmd == "sends":

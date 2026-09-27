@@ -263,3 +263,50 @@ class PyMaxTransport(PersonalAccountTransport):
             await client.close()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+class PyMaxHistoryReader:
+    """Только чтение для выгрузки истории (gateway/history_export.py). Отправок и отметок нет."""
+
+    def __init__(self, client: Client) -> None:
+        self._client = client
+        me = client.me
+        if me is None:
+            raise RuntimeError("Клиент MAX не вошёл в аккаунт")
+        self.my_id: int = me.contact.id
+
+    async def fetch_chats(self, marker: int | None) -> list[Any]:
+        return await self._client.fetch_chats(marker=marker)
+
+    async def get_users(self, user_ids: list[int]) -> list[Any]:
+        return await self._client.get_users(user_ids)
+
+    async def fetch_history(self, chat_id: int, backward: int, from_time: int | None) -> list[Any]:
+        return await self._client.fetch_history(chat_id, backward=backward, from_time=from_time, interactive=False)
+
+
+async def run_readonly(phone: str, session_dir: Path, job) -> Any:  # type: ignore[no-untyped-def]
+    """Подключиться по существующей сессии (без SMS), выполнить job(reader) и отключиться."""
+    if not (session_dir / SESSION_NAME).exists():
+        raise LoginRequiredError("Файла сессии нет. Нужен вход: python -m gateway login")
+    t = PyMaxTransport(phone, session_dir)
+    client = t._build_client(auth_flow=RefuseAuthFlow())
+    started = asyncio.Event()
+
+    @client.on_start()
+    async def _on_start(c: Client) -> None:
+        started.set()
+
+    task = asyncio.create_task(client.start())
+    waiter = asyncio.create_task(started.wait())
+    try:
+        done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            task.result()
+            raise RuntimeError("Клиент MAX завершился до входа")
+        return await job(PyMaxHistoryReader(client))
+    finally:
+        waiter.cancel()
+        await client.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
